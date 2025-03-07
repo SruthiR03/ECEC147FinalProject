@@ -25,14 +25,28 @@ specaug:
   n_freq_masks: 2
   freq_mask_param: 4
 
+timestretch:
+  _target_: emg2qwerty.transforms.TimeStretch
+  stretch_factor: [0.8, 1.2]  # Random stretching/compression within this range
+
+minmax_normalize:
+  _target_: emg2qwerty.transforms.MinMaxNormalize
+  min_val: 0.0
+  max_val: 1.0
+
+downsample:
+  _target_: emg2qwerty.transforms.Downsample
+  factor: 2  # Adjust factor based on desired sampling rate reduction
+
 transforms:
   train:
     - ${to_tensor}
-    - ${band_rotation}
     - ${temporal_jitter}
     - ${logspec}
     - ${specaug}
-
+    - ${downsample}
+    - ${minmax_normalize}
+    
   val:
     - ${to_tensor}
     - ${logspec}

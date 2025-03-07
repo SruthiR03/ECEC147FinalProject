@@ -9,7 +9,7 @@ defaults:
   - _self_
 
 seed: 1501
-batch_size: 32
+batch_size: 8
 num_workers: 4  # Number of workers for dataloading
 train: True  # Whether to train or only run validation and test
 checkpoint: null  # Optional path to checkpoint file
@@ -20,7 +20,7 @@ trainer:
   accelerator: gpu
   devices: 1
   num_nodes: 1
-  max_epochs: 150
+  max_epochs: 30
   default_root_dir: ${hydra:runtime.output_dir}
 
 callbacks:

@@ -243,3 +243,60 @@ class SpecAugment:
 
         # (..., C, freq, T) -> (T, ..., C, freq)
         return x.movedim(-1, 0)
+
+# these are the techniques that we added:
+@dataclass
+class Downsample:
+    """Downsamples the EMG signal by a specified factor.
+
+    Args:
+        factor (int): The downsampling factor (must be >= 1).
+    """
+
+    factor: int
+
+    def __post_init__(self) -> None:
+        assert self.factor >= 1, "Downsampling factor must be at least 1"
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor[::self.factor]
+
+@dataclass
+class MinMaxNormalize:
+    """Normalizes the EMG signal between a given range.
+
+    Args:
+        min_val (float): Minimum value of the range (default: 0.0).
+        max_val (float): Maximum value of the range (default: 1.0).
+    """
+
+    min_val: float = 0.0
+    max_val: float = 1.0
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        min_t = tensor.min()
+        max_t = tensor.max()
+        return (tensor - min_t) / (max_t - min_t) * (self.max_val - self.min_val) + self.min_val
+
+
+@dataclass
+class TimeStretch:
+    """Randomly stretches or compresses the EMG signal in time.
+
+    Args:
+        stretch_factor (tuple): Range of stretching factors (default: (0.8, 1.2)).
+    """
+
+    stretch_factor: Sequence[float] = (0.8, 1.2)
+
+    def __post_init__(self) -> None:
+        assert len(self.stretch_factor) == 2, "Stretch factor must be a tuple (min, max)"
+        assert 0 < self.stretch_factor[0] <= self.stretch_factor[1], "Invalid stretch range"
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        factor = np.random.uniform(self.stretch_factor[0], self.stretch_factor[1])
+        T = tensor.shape[0]
+        new_T = int(T * factor)
+        indices = np.linspace(0, T - 1, new_T).astype(int)
+        return tensor[indices]
+
