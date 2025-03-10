@@ -25,6 +25,7 @@ from emg2qwerty.modules import (
     MultiBandRotationInvariantMLP,
     SpectrogramNorm,
     TDSConvEncoder,
+    RNNEncoder,
 )
 from emg2qwerty.transforms import Transform
 
@@ -150,6 +151,10 @@ class TDSConvCTCModule(pl.LightningModule):
         optimizer: DictConfig,
         lr_scheduler: DictConfig,
         decoder: DictConfig,
+        use_rnn: bool = False,
+        rnn_hidden_size: int = 256,
+        rnn_num_layers: int = 2,
+        rnn_bidirectional: bool = True
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -159,28 +164,44 @@ class TDSConvCTCModule(pl.LightningModule):
         # Model
         # inputs: (T, N, bands=2, electrode_channels=16, freq)
         self.model = nn.Sequential(
-            # (T, N, bands=2, C=16, freq)
             SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
-            # (T, N, bands=2, mlp_features[-1])
             MultiBandRotationInvariantMLP(
                 in_features=in_features,
                 mlp_features=mlp_features,
                 num_bands=self.NUM_BANDS,
             ),
-            # (T, N, num_features)
             nn.Flatten(start_dim=2),
-            TDSConvEncoder(
-                num_features=num_features,
-                block_channels=block_channels,
-                kernel_width=kernel_width,
-            ),
-            # (T, N, num_classes)
-            nn.Linear(num_features, charset().num_classes),
-            nn.LogSoftmax(dim=-1),
         )
 
+        if use_rnn:
+            print("Using RNN Encoder instead of TDSConvEncoder")
+            self.model.add_module(
+                "RNNEncoder",
+                RNNEncoder(
+                    input_size=num_features,
+                    hidden_size=rnn_hidden_size,
+                    num_layers=rnn_num_layers,
+                    bidirectional=rnn_bidirectional
+                ),
+            )
+            output_size = rnn_hidden_size * (2 if rnn_bidirectional else 1)
+        else:
+            print("Using TDSConvEncoder")
+            self.model.add_module(
+                "TDSConvEncoder",
+                TDSConvEncoder(
+                    num_features=num_features,
+                    block_channels=block_channels,
+                    kernel_width=kernel_width,
+                ),
+            )
+            output_size = num_features
+        char_set = charset()
+        self.model.add_module("Linear", nn.Linear(output_size, char_set.num_classes))
+        self.model.add_module("LogSoftmax", nn.LogSoftmax(dim=-1))
+
         # Criterion
-        self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
+        self.ctc_loss = nn.CTCLoss(blank=char_set.null_class)
 
         # Decoder
         self.decoder = instantiate(decoder)
@@ -212,8 +233,14 @@ class TDSConvCTCModule(pl.LightningModule):
         # temporal receptive field to compute output activation lengths for CTCLoss.
         # NOTE: This assumes the encoder doesn't perform any temporal downsampling
         # such as by striding.
-        T_diff = inputs.shape[0] - emissions.shape[0]
-        emission_lengths = input_lengths - T_diff
+        if self.hparams.use_rnn:
+            emission_lengths = input_lengths  # RNNs do not shrink time
+        else:
+            T_diff = inputs.shape[0] - emissions.shape[0]  # TDS shrinks time
+            emission_lengths = input_lengths - T_diff
+
+        # Ensure all lengths are positive
+        emission_lengths = torch.clamp(emission_lengths, min=1)
 
         loss = self.ctc_loss(
             log_probs=emissions,  # (T, N, num_classes)
@@ -238,6 +265,10 @@ class TDSConvCTCModule(pl.LightningModule):
             metrics.update(prediction=predictions[i], target=target)
 
         self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
+
+        if targets.nelement() == 0:
+            print("⚠️ Warning: Targets are empty! Check data loading pipeline.")
+
         return loss
 
     def _epoch_end(self, phase: str) -> None:

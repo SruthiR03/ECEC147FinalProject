@@ -8,6 +8,7 @@ from collections.abc import Sequence
 
 import torch
 from torch import nn
+from emg2qwerty.charset import charset
 
 
 class SpectrogramNorm(nn.Module):
@@ -278,3 +279,21 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+
+class RNNEncoder(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, rnn_type="LSTM", bidirectional=False):
+        super().__init__()
+        rnn_cls = nn.LSTM if rnn_type == "LSTM" else nn.GRU
+        
+        self.rnn = rnn_cls(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=False,
+            bidirectional=bidirectional
+        )
+    
+    def forward(self, x):
+        output, _ = self.rnn(x)
+        return output
+

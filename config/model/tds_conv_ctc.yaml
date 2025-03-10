@@ -5,6 +5,10 @@ module:
   mlp_features: [192]
   block_channels: [12, 12, 12, 12]
   kernel_width: 32  # Total temporal receptive field of 125 samples given 4 layers
+  use_rnn: True
+  rnn_hidden_size: 256
+  rnn_num_layers: 2
+  rnn_bidirectional: True
 
 datamodule:
   _target_: emg2qwerty.lightning.WindowedEMGDataModule
