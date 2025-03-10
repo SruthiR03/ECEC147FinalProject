@@ -266,9 +266,6 @@ class TDSConvCTCModule(pl.LightningModule):
 
         self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
 
-        if targets.nelement() == 0:
-            print("⚠️ Warning: Targets are empty! Check data loading pipeline.")
-
         return loss
 
     def _epoch_end(self, phase: str) -> None:
