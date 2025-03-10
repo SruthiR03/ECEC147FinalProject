@@ -197,6 +197,7 @@ class TDSConvCTCModule(pl.LightningModule):
             )
             output_size = num_features
         char_set = charset()
+        self.model.add_module("Dropout", nn.Dropout(p=0.3))
         self.model.add_module("Linear", nn.Linear(output_size, char_set.num_classes))
         self.model.add_module("LogSoftmax", nn.LogSoftmax(dim=-1))
 
