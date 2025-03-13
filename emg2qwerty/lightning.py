@@ -28,6 +28,7 @@ from emg2qwerty.modules import (
 )
 from emg2qwerty.transforms import Transform
 
+import pandas as pd
 
 class WindowedEMGDataModule(pl.LightningDataModule):
     def __init__(
@@ -150,9 +151,13 @@ class TDSConvCTCModule(pl.LightningModule):
         optimizer: DictConfig,
         lr_scheduler: DictConfig,
         decoder: DictConfig,
+        l1_lambda: float = 1e-5,
+        l2_lambda: float = 1e-4,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
+        self.l1_lambda = l1_lambda
+        self.l2_lambda = l2_lambda
 
         num_features = self.NUM_BANDS * mlp_features[-1]
 
@@ -175,6 +180,7 @@ class TDSConvCTCModule(pl.LightningModule):
                 kernel_width=kernel_width,
             ),
             # (T, N, num_classes)
+            nn.Dropout(p=0.2),
             nn.Linear(num_features, charset().num_classes),
             nn.LogSoftmax(dim=-1),
         )
@@ -193,6 +199,7 @@ class TDSConvCTCModule(pl.LightningModule):
                 for phase in ["train", "val", "test"]
             }
         )
+        self.logged_predictions = []
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.model(inputs)
@@ -222,11 +229,28 @@ class TDSConvCTCModule(pl.LightningModule):
             target_lengths=target_lengths,  # (N,)
         )
 
+        l1_reg = 0.0
+        l2_reg = 0.0
+        for name, param in self.named_parameters():
+            if param.requires_grad and "bias" not in name:
+                l1_reg += param.abs().sum()  # L1 regularization (Lasso)
+                l2_reg += param.pow(2).sum()  # L2 regularization (Ridge)
+
+        loss = loss + self.l1_lambda * l1_reg + self.l2_lambda * l2_reg
+
         # Decode emissions
         predictions = self.decoder.decode_batch(
             emissions=emissions.detach().cpu().numpy(),
             emission_lengths=emission_lengths.detach().cpu().numpy(),
         )
+
+        for i, pred in enumerate(predictions):
+            self.logged_predictions.append({
+                "epoch": self.current_epoch,
+                "batch_idx": kwargs.get("batch_idx", 0),
+                "sample_idx": i,
+                "prediction": pred
+            })
 
         # Update metrics
         metrics = self.metrics[f"{phase}_metrics"]
@@ -244,6 +268,11 @@ class TDSConvCTCModule(pl.LightningModule):
         metrics = self.metrics[f"{phase}_metrics"]
         self.log_dict(metrics.compute(), sync_dist=True)
         metrics.reset()
+
+        if self.logged_predictions:
+            df = pd.DataFrame(self.logged_predictions)
+            df.to_csv(f"{self.logger.log_dir}/{phase}_predictions_epoch_{self.current_epoch}.csv", index=False)
+            self.logged_predictions = []  # Clear after saving
 
     def training_step(self, *args, **kwargs) -> torch.Tensor:
         return self._step("train", *args, **kwargs)
