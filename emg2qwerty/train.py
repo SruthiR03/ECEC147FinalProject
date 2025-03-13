@@ -18,6 +18,7 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from emg2qwerty import transforms, utils
 from emg2qwerty.transforms import Transform
+from pytorch_lightning.loggers import CSVLogger
 
 
 log = logging.getLogger(__name__)
@@ -89,11 +90,14 @@ def main(config: DictConfig):
     # Instantiate callbacks
     callback_configs = config.get("callbacks", [])
     callbacks = [instantiate(cfg) for cfg in callback_configs]
+    
+    csv_logger = CSVLogger("logs_test/",name="log_test_model")
 
     # Initialize trainer
     trainer = pl.Trainer(
         **config.trainer,
         callbacks=callbacks,
+        logger=csv_logger
     )
 
     if config.train:

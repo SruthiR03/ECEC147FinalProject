@@ -297,3 +297,42 @@ class RNNEncoder(nn.Module):
         output, _ = self.rnn(x)
         return output
 
+class HybridEncoder(nn.Module):
+    """
+    A CNN+RNN hybrid: TDSConvEncoder first, then an RNN.
+    """
+
+    def __init__(
+        self,
+        tds_num_features: int,
+        tds_block_channels: list[int],
+        tds_kernel_width: int,
+        rnn_hidden_size: int,
+        rnn_num_layers: int,
+        rnn_bidirectional: bool = True,
+        rnn_type: str = "LSTM",
+    ):
+        super().__init__()
+
+        # 1) TDSConvEncoder for local temporal modeling
+        self.tds = TDSConvEncoder(
+            num_features=tds_num_features,
+            block_channels=tds_block_channels,
+            kernel_width=tds_kernel_width,
+        )
+
+        # 2) RNN for long-range dependencies
+        rnn_cls = nn.LSTM if rnn_type == "LSTM" else nn.GRU
+        self.rnn = rnn_cls(
+            input_size=tds_num_features,
+            hidden_size=rnn_hidden_size,
+            num_layers=rnn_num_layers,
+            batch_first=False,    # shape is (T, N, Features)
+            bidirectional=rnn_bidirectional,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (T, N, tds_num_features) going into TDS
+        x = self.tds(x)   # still shape (T, N, tds_num_features)
+        x, _ = self.rnn(x)  # (T, N, rnn_hidden_size * 2 if bidirectional)
+        return x

@@ -7,6 +7,7 @@
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, ClassVar
+import pandas as pd
 
 import numpy as np
 import pytorch_lightning as pl
@@ -26,6 +27,7 @@ from emg2qwerty.modules import (
     SpectrogramNorm,
     TDSConvEncoder,
     RNNEncoder,
+    HybridEncoder
 )
 from emg2qwerty.transforms import Transform
 
@@ -152,6 +154,7 @@ class TDSConvCTCModule(pl.LightningModule):
         lr_scheduler: DictConfig,
         decoder: DictConfig,
         use_rnn: bool = False,
+        use_hybrid: bool = False,
         rnn_hidden_size: int = 256,
         rnn_num_layers: int = 2,
         rnn_bidirectional: bool = True
@@ -173,7 +176,22 @@ class TDSConvCTCModule(pl.LightningModule):
             nn.Flatten(start_dim=2),
         )
 
-        if use_rnn:
+        if use_hybrid:
+            print("Using HybridEncoder (CNN + RNN)")
+            self.model.add_module(
+                "HybridEncoder",
+                HybridEncoder(
+                    tds_num_features=num_features,
+                    tds_block_channels=block_channels,
+                    tds_kernel_width=kernel_width,
+                    rnn_hidden_size=rnn_hidden_size,
+                    rnn_num_layers=rnn_num_layers,
+                    rnn_bidirectional=rnn_bidirectional,
+                    rnn_type="LSTM",
+                )
+            )
+            output_size = rnn_hidden_size * (2 if rnn_bidirectional else 1)
+        elif use_rnn:
             print("Using RNN Encoder instead of TDSConvEncoder")
             self.model.add_module(
                 "RNNEncoder",
@@ -215,6 +233,8 @@ class TDSConvCTCModule(pl.LightningModule):
             }
         )
 
+        self.logged_predictions = []
+
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.model(inputs)
 
@@ -255,6 +275,14 @@ class TDSConvCTCModule(pl.LightningModule):
             emission_lengths=emission_lengths.detach().cpu().numpy(),
         )
 
+        for i, pred in enumerate (predictions):
+            self.logged_predictions.append({
+                "epoch": self.current_epoch,
+                "batch_idx": kwargs.get("batch_idx", 0),
+                "sample_idx": i,
+                "prediction": pred
+            })
+
         # Update metrics
         metrics = self.metrics[f"{phase}_metrics"]
         targets = targets.detach().cpu().numpy()
@@ -272,6 +300,10 @@ class TDSConvCTCModule(pl.LightningModule):
         metrics = self.metrics[f"{phase}_metrics"]
         self.log_dict(metrics.compute(), sync_dist=True)
         metrics.reset()
+        if self.logged_predictions:
+            df = pd.DataFrame(self.logged_predictions)
+            df.to_csv(f"{self.logger.log_dir}/{phase}_predictions_epoch_{self.current_epoch}.csv", index=False)
+            self.logged_predictions = [] # Clear after saving
 
     def training_step(self, *args, **kwargs) -> torch.Tensor:
         return self._step("train", *args, **kwargs)
