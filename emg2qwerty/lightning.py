@@ -141,6 +141,19 @@ class WindowedEMGDataModule(pl.LightningDataModule):
         )
 
 
+class TransposedBatchNorm1d(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.bn = nn.BatchNorm1d(num_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x is expected to be (T, N, C)
+        x = x.transpose(0, 1).transpose(1, 2)  # now shape is (N, C, T)
+        x = self.bn(x)
+        x = x.transpose(1, 2).transpose(0, 1)  # revert back to (T, N, C)
+        return x
+
+
 class TDSConvCTCModule(pl.LightningModule):
     NUM_BANDS: ClassVar[int] = 2
     ELECTRODE_CHANNELS: ClassVar[int] = 16
@@ -172,12 +185,15 @@ class TDSConvCTCModule(pl.LightningModule):
         # Model
         # inputs: (T, N, bands=2, electrode_channels=16, freq)
         self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
             SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            # (T, N, bands=2, mlp_features[-1])
             MultiBandRotationInvariantMLP(
                 in_features=in_features,
                 mlp_features=mlp_features,
                 num_bands=self.NUM_BANDS,
             ),
+            # (T, N, num_features)
             nn.Flatten(start_dim=2),
             TDSConvEncoder(
                 num_features=num_features,
@@ -186,6 +202,8 @@ class TDSConvCTCModule(pl.LightningModule):
             ),
             # (T, N, num_classes)
             nn.Dropout(p=0.2),
+            # nn.Dropout(p=0.3),  # Added dropout layer with 30% probability
+            TransposedBatchNorm1d(num_features),
             nn.Linear(num_features, charset().num_classes),
             nn.LogSoftmax(dim=-1),
         )
@@ -233,7 +251,7 @@ class TDSConvCTCModule(pl.LightningModule):
         self.model.add_module("LogSoftmax", nn.LogSoftmax(dim=-1))
 
         # Criterion
-        self.ctc_loss = nn.CTCLoss(blank=char_set.null_class)
+        self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
 
         # Decoder
         self.decoder = instantiate(decoder)
@@ -266,14 +284,8 @@ class TDSConvCTCModule(pl.LightningModule):
         # temporal receptive field to compute output activation lengths for CTCLoss.
         # NOTE: This assumes the encoder doesn't perform any temporal downsampling
         # such as by striding.
-        if self.hparams.use_rnn:
-            emission_lengths = input_lengths  # RNNs do not shrink time
-        else:
-            T_diff = inputs.shape[0] - emissions.shape[0]  # TDS shrinks time
-            emission_lengths = input_lengths - T_diff
-
-        # Ensure all lengths are positive
-        emission_lengths = torch.clamp(emission_lengths, min=1)
+        T_diff = inputs.shape[0] - emissions.shape[0]
+        emission_lengths = input_lengths - T_diff
 
         loss = self.ctc_loss(
             log_probs=emissions,  # (T, N, num_classes)
@@ -290,6 +302,11 @@ class TDSConvCTCModule(pl.LightningModule):
                 l2_reg += param.pow(2).sum()  # L2 regularization (Ridge)
 
         loss = loss + self.l1_lambda * l1_reg + self.l2_lambda * l2_reg
+        # l2_reg = 0.0
+        # for name, param in self.named_parameters():
+        #     if param.requires_grad and "bias" not in name:
+        #         l2_reg += param.pow(2).sum()
+        # loss = loss + self.l2_lambda * l2_reg
 
         # Decode emissions
         predictions = self.decoder.decode_batch(
@@ -330,6 +347,12 @@ class TDSConvCTCModule(pl.LightningModule):
         if self.logged_predictions:
             df = pd.DataFrame(self.logged_predictions)
             df.to_csv(f"{self.logger.log_dir}/{phase}_predictions_epoch_{self.current_epoch}.csv", index=False)
+            self.logged_predictions = []  # Clear after saving
+
+        if self.logged_predictions:
+            df = pd.DataFrame(self.logged_predictions)
+            df.to_csv(
+                f"{self.logger.log_dir}/{phase}_predictions_epoch_{self.current_epoch}.csv", index=False)
             self.logged_predictions = []  # Clear after saving
 
     def training_step(self, *args, **kwargs) -> torch.Tensor:
