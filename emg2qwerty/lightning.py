@@ -25,9 +25,10 @@ from emg2qwerty.modules import (
     MultiBandRotationInvariantMLP,
     SpectrogramNorm,
     TDSConvEncoder,
-    RNNEncoder,
 )
 from emg2qwerty.transforms import Transform
+
+import pandas as pd
 
 
 class WindowedEMGDataModule(pl.LightningDataModule):
@@ -138,6 +139,19 @@ class WindowedEMGDataModule(pl.LightningDataModule):
         )
 
 
+class TransposedBatchNorm1d(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.bn = nn.BatchNorm1d(num_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x is expected to be (T, N, C)
+        x = x.transpose(0, 1).transpose(1, 2)  # now shape is (N, C, T)
+        x = self.bn(x)
+        x = x.transpose(1, 2).transpose(0, 1)  # revert back to (T, N, C)
+        return x
+
+
 class TDSConvCTCModule(pl.LightningModule):
     NUM_BANDS: ClassVar[int] = 2
     ELECTRODE_CHANNELS: ClassVar[int] = 16
@@ -151,58 +165,41 @@ class TDSConvCTCModule(pl.LightningModule):
         optimizer: DictConfig,
         lr_scheduler: DictConfig,
         decoder: DictConfig,
-        use_rnn: bool = False,
-        rnn_hidden_size: int = 256,
-        rnn_num_layers: int = 2,
-        rnn_bidirectional: bool = True
+        l2_lambda: float = 1e-4,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
+        self.l2_lambda = l2_lambda
 
         num_features = self.NUM_BANDS * mlp_features[-1]
 
         # Model
         # inputs: (T, N, bands=2, electrode_channels=16, freq)
         self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
             SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            # (T, N, bands=2, mlp_features[-1])
             MultiBandRotationInvariantMLP(
                 in_features=in_features,
                 mlp_features=mlp_features,
                 num_bands=self.NUM_BANDS,
             ),
+            # (T, N, num_features)
             nn.Flatten(start_dim=2),
+            TDSConvEncoder(
+                num_features=num_features,
+                block_channels=block_channels,
+                kernel_width=kernel_width,
+            ),
+            # (T, N, num_classes)
+            # nn.Dropout(p=0.3),  # Added dropout layer with 30% probability
+            TransposedBatchNorm1d(num_features),
+            nn.Linear(num_features, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
         )
 
-        if use_rnn:
-            print("Using RNN Encoder instead of TDSConvEncoder")
-            self.model.add_module(
-                "RNNEncoder",
-                RNNEncoder(
-                    input_size=num_features,
-                    hidden_size=rnn_hidden_size,
-                    num_layers=rnn_num_layers,
-                    bidirectional=rnn_bidirectional
-                ),
-            )
-            output_size = rnn_hidden_size * (2 if rnn_bidirectional else 1)
-        else:
-            print("Using TDSConvEncoder")
-            self.model.add_module(
-                "TDSConvEncoder",
-                TDSConvEncoder(
-                    num_features=num_features,
-                    block_channels=block_channels,
-                    kernel_width=kernel_width,
-                ),
-            )
-            output_size = num_features
-        char_set = charset()
-        self.model.add_module("Dropout", nn.Dropout(p=0.3))
-        self.model.add_module("Linear", nn.Linear(output_size, char_set.num_classes))
-        self.model.add_module("LogSoftmax", nn.LogSoftmax(dim=-1))
-
         # Criterion
-        self.ctc_loss = nn.CTCLoss(blank=char_set.null_class)
+        self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
 
         # Decoder
         self.decoder = instantiate(decoder)
@@ -215,6 +212,7 @@ class TDSConvCTCModule(pl.LightningModule):
                 for phase in ["train", "val", "test"]
             }
         )
+        self.logged_predictions = []
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.model(inputs)
@@ -234,14 +232,8 @@ class TDSConvCTCModule(pl.LightningModule):
         # temporal receptive field to compute output activation lengths for CTCLoss.
         # NOTE: This assumes the encoder doesn't perform any temporal downsampling
         # such as by striding.
-        if self.hparams.use_rnn:
-            emission_lengths = input_lengths  # RNNs do not shrink time
-        else:
-            T_diff = inputs.shape[0] - emissions.shape[0]  # TDS shrinks time
-            emission_lengths = input_lengths - T_diff
-
-        # Ensure all lengths are positive
-        emission_lengths = torch.clamp(emission_lengths, min=1)
+        T_diff = inputs.shape[0] - emissions.shape[0]
+        emission_lengths = input_lengths - T_diff
 
         loss = self.ctc_loss(
             log_probs=emissions,  # (T, N, num_classes)
@@ -250,11 +242,25 @@ class TDSConvCTCModule(pl.LightningModule):
             target_lengths=target_lengths,  # (N,)
         )
 
+        # l2_reg = 0.0
+        # for name, param in self.named_parameters():
+        #     if param.requires_grad and "bias" not in name:
+        #         l2_reg += param.pow(2).sum()
+        # loss = loss + self.l2_lambda * l2_reg
+
         # Decode emissions
         predictions = self.decoder.decode_batch(
             emissions=emissions.detach().cpu().numpy(),
             emission_lengths=emission_lengths.detach().cpu().numpy(),
         )
+
+        for i, pred in enumerate(predictions):
+            self.logged_predictions.append({
+                "epoch": self.current_epoch,
+                "batch_idx": kwargs.get("batch_idx", 0),
+                "sample_idx": i,
+                "prediction": pred
+            })
 
         # Update metrics
         metrics = self.metrics[f"{phase}_metrics"]
@@ -266,16 +272,18 @@ class TDSConvCTCModule(pl.LightningModule):
             metrics.update(prediction=predictions[i], target=target)
 
         self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
-
-        if targets.nelement() == 0:
-            print("⚠️ Warning: Targets are empty! Check data loading pipeline.")
-
         return loss
 
     def _epoch_end(self, phase: str) -> None:
         metrics = self.metrics[f"{phase}_metrics"]
         self.log_dict(metrics.compute(), sync_dist=True)
         metrics.reset()
+
+        if self.logged_predictions:
+            df = pd.DataFrame(self.logged_predictions)
+            df.to_csv(
+                f"{self.logger.log_dir}/{phase}_predictions_epoch_{self.current_epoch}.csv", index=False)
+            self.logged_predictions = []  # Clear after saving
 
     def training_step(self, *args, **kwargs) -> torch.Tensor:
         return self._step("train", *args, **kwargs)
